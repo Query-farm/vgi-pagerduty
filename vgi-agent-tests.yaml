@@ -1,0 +1,96 @@
+# Private graders for the public vgi.agent_test_tasks in the worker's catalog metadata.
+# `vgi-lint lint --ai` runs an agent on each prompt and grades it (VGI920).
+#
+# Every pagerduty relation needs a `pagerduty` secret pointing at a PagerDuty account (the
+# offline replay account in test/mock_api/server.py works too:
+# CREATE SECRET (TYPE pagerduty, API_TOKEN 'test-token', BASE_URL 'http://127.0.0.1:<port>')).
+# The replay account is stable between the agent's run and the reference run, so every task
+# compares against a reference query; oncall_now depends on today's date in both runs alike.
+tasks:
+  - name: open_incidents
+    reference_sql: >-
+      SELECT incident_number, title FROM pagerduty.main.incidents()
+      WHERE status IN ('triggered', 'acknowledged') ORDER BY incident_number
+  - name: incidents_per_service
+    reference_sql: >-
+      SELECT service, count(*) AS incidents FROM pagerduty.main.incidents(date_range := 'all')
+      GROUP BY service ORDER BY service
+  - name: mtta_checkout
+    reference_sql: >-
+      SELECT time_to_ack_seconds FROM pagerduty.main.incidents(date_range := 'all', with_timeline := true)
+      WHERE incident_number = 1042
+  - name: who_acked
+    reference_sql: >-
+      SELECT agent_name FROM pagerduty.main.incident_log_entries(incident_id := 'Q2CHECKOUT500')
+      WHERE type = 'acknowledge'
+  - name: incident_alert_count
+    reference_sql: >-
+      SELECT severity, count(*) AS alerts FROM pagerduty.main.incident_alerts(incident_id := 'Q2CHECKOUT500')
+      GROUP BY severity ORDER BY severity
+  - name: oncall_now
+    reference_sql: >-
+      SELECT user_name FROM pagerduty.main.oncalls()
+      WHERE escalation_policy_name = 'Checkout' AND escalation_level = 1
+  - name: escalation_chain
+    reference_sql: >-
+      SELECT level, target_type, target_name FROM pagerduty.main.escalation_rules
+      WHERE escalation_policy = 'Payments' ORDER BY level, target_name
+  - name: team_members
+    reference_sql: >-
+      SELECT team_name, user_name FROM pagerduty.main.team_members WHERE role = 'manager' ORDER BY team_name
+  - name: business_dependencies
+    reference_sql: >-
+      SELECT s.name FROM pagerduty.main.service_dependencies d
+      JOIN pagerduty.main.business_services b ON b.business_service_id = d.dependent_service_id
+      JOIN pagerduty.main.services s ON s.service_id = d.supporting_service_id
+      WHERE b.name = 'Online Store' ORDER BY s.name
+  - name: users_without_phone
+    reference_sql: >-
+      SELECT name FROM pagerduty.main.users WHERE NOT list_contains(contact_method_types, 'phone') ORDER BY name
+  - name: priorities_order
+    reference_sql: SELECT name FROM pagerduty.main.priorities ORDER BY rank
+  - name: features
+    reference_sql: SELECT available FROM pagerduty.main.account_features WHERE feature = 'analytics'
+  - name: monthly_mtta
+    reference_sql: >-
+      SELECT range_start, total_incident_count, mean_time_to_ack_seconds
+      FROM pagerduty.main.analytics_incident_metrics(since := TIMESTAMPTZ '2026-09-01 00:00:00+00',
+        until := TIMESTAMPTZ '2026-12-01 00:00:00+00', aggregate_unit := 'month') ORDER BY range_start
+  - name: sleep_interruptions
+    reference_sql: >-
+      SELECT incident_number FROM pagerduty.main.analytics_incidents(since := TIMESTAMPTZ '2026-01-01 00:00:00+00',
+        until := TIMESTAMPTZ '2027-01-01 00:00:00+00') WHERE sleep_hour_interruptions > 0 ORDER BY incident_number
+  - name: recent_deletes
+    reference_sql: >-
+      SELECT actor_name, root_resource_type, root_resource_name FROM pagerduty.main.audit_records(
+        since := TIMESTAMPTZ '2026-11-01 00:00:00+00', until := TIMESTAMPTZ '2026-12-01 00:00:00+00')
+      WHERE action = 'delete' ORDER BY execution_time
+  - name: deploy_before_incident
+    reference_sql: >-
+      SELECT summary FROM pagerduty.main.change_events(since := TIMESTAMPTZ '2026-11-01 00:00:00+00',
+        until := TIMESTAMPTZ '2026-11-16 00:00:00+00') WHERE list_contains(services, 'Checkout API') ORDER BY occurred_at
+  - name: policy_services
+    reference_sql: >-
+      SELECT s.name FROM pagerduty.main.services s
+      JOIN pagerduty.main.escalation_policies p ON p.escalation_policy_id = s.escalation_policy_id
+      WHERE p.name = 'Checkout' ORDER BY s.name
+  - name: incident_notes
+    reference_sql: >-
+      SELECT user_name, content FROM pagerduty.main.incident_notes(incident_id := 'Q2CHECKOUT500') ORDER BY created_at
+  - name: ongoing_maintenance
+    reference_sql: SELECT description FROM pagerduty.main.maintenance_windows WHERE status = 'ongoing' ORDER BY description
+  - name: oncall_hours
+    reference_sql: >-
+      SELECT user_name, sum(duration_seconds) / 3600 AS hours FROM pagerduty.main.schedule_entries(
+        since := TIMESTAMPTZ '2026-11-01 00:00:00+00', until := TIMESTAMPTZ '2026-11-29 00:00:00+00')
+      WHERE schedule_name = 'Payments Primary' GROUP BY user_name ORDER BY user_name
+  - name: schedule_time_zones
+    reference_sql: SELECT name, time_zone FROM pagerduty.main.schedules ORDER BY name
+  - name: status_page_list
+    reference_sql: SELECT name FROM pagerduty.main.status_pages WHERE status_page_type = 'public' ORDER BY name
+  - name: tag_labels
+    reference_sql: SELECT label FROM pagerduty.main.tags ORDER BY label
+  - name: team_hierarchy
+    reference_sql: >-
+      SELECT t.name, p.name AS parent FROM pagerduty.main.teams t JOIN pagerduty.main.teams p ON p.team_id = t.parent_team_id
+      ORDER BY t.name

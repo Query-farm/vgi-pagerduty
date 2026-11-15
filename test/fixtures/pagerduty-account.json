@@ -1,0 +1,100 @@
+{
+  "_comment": "A hand-built PagerDuty account for the replay server (test/mock_api/server.py). Compact records; the server expands them into the documented REST API v2 shapes (references with id/type/summary/self/html_url).",
+  "users": [
+    {"id": "PUSRADA", "name": "Ada Lovelace", "email": "ada@example.com", "role": "admin", "job_title": "SRE Lead", "time_zone": "Europe/London", "description": "Platform on-call lead", "invitation_sent": false, "teams": ["PTEAMPLAT", "PTEAMPAY"], "contact_methods": [["PCMADA1", "email"], ["PCMADA2", "phone"], ["PCMADA3", "push_notification"]]},
+    {"id": "PUSRGRACE", "name": "Grace Hopper", "email": "grace@example.com", "role": "user", "job_title": "Payments Engineer", "time_zone": "America/New_York", "description": null, "invitation_sent": false, "teams": ["PTEAMPAY"], "contact_methods": [["PCMGRACE1", "email"], ["PCMGRACE2", "sms"]]},
+    {"id": "PUSRALAN", "name": "Alan Turing", "email": "alan@example.com", "role": "limited_user", "job_title": "Platform Engineer", "time_zone": "Europe/London", "description": null, "invitation_sent": true, "teams": ["PTEAMPLAT"], "contact_methods": [["PCMALAN1", "email"]]},
+    {"id": "PUSRKAT", "name": "Katherine Johnson", "email": "kat@example.com", "role": "user", "job_title": "Payments Engineer", "time_zone": "America/Chicago", "description": null, "invitation_sent": false, "teams": ["PTEAMPAY"], "contact_methods": [["PCMKAT1", "email"], ["PCMKAT2", "phone"], ["PCMKAT3", "phone"]]}
+  ],
+  "teams": [
+    {"id": "PTEAMPLAT", "name": "Platform", "description": "Checkout and search infrastructure", "parent": null,
+     "members": [["PUSRADA", "manager"], ["PUSRALAN", "responder"]]},
+    {"id": "PTEAMPAY", "name": "Payments", "description": "Payments and billing", "parent": "PTEAMPLAT",
+     "members": [["PUSRGRACE", "manager"], ["PUSRKAT", "responder"], ["PUSRADA", "observer"]]}
+  ],
+  "schedules": [
+    {"id": "PSCHCHK", "name": "Checkout Primary", "description": "Weekly Platform rotation", "time_zone": "Etc/UTC", "rotation": ["PUSRADA", "PUSRALAN"], "escalation_policies": ["PEPCHK"], "teams": ["PTEAMPLAT"]},
+    {"id": "PSCHPAY", "name": "Payments Primary", "description": "Weekly Payments rotation", "time_zone": "America/New_York", "rotation": ["PUSRGRACE", "PUSRKAT"], "escalation_policies": ["PEPPAY"], "teams": ["PTEAMPAY"]}
+  ],
+  "rotation_epoch": "2026-11-01T00:00:00Z",
+  "rotation_days": 7,
+  "escalation_policies": [
+    {"id": "PEPCHK", "name": "Checkout", "description": "Pages the Checkout rotation, then Grace", "num_loops": 0, "on_call_handoff_notifications": "if_has_services", "teams": ["PTEAMPLAT"], "services": ["PSVCCHK", "PSVCSEARCH"],
+     "rules": [["PRULECHK1", 15, [["schedule", "PSCHCHK"]]], ["PRULECHK2", 30, [["user", "PUSRGRACE"]]]]},
+    {"id": "PEPPAY", "name": "Payments", "description": "Payments rotation, then Kat, then Ada", "num_loops": 2, "on_call_handoff_notifications": "always", "teams": ["PTEAMPAY"], "services": ["PSVCPAY"],
+     "rules": [["PRULEPAY1", 10, [["schedule", "PSCHPAY"]]], ["PRULEPAY2", 20, [["user", "PUSRKAT"]]], ["PRULEPAY3", 30, [["user", "PUSRADA"], ["user", "PUSRGRACE"]]]]}
+  ],
+  "services": [
+    {"id": "PSVCCHK", "name": "Checkout API", "description": "Customer checkout", "status": "active", "escalation_policy": "PEPCHK", "teams": ["PTEAMPLAT"], "created_at": "2024-01-10T12:00:00Z", "updated_at": "2026-11-02T10:00:00Z", "last_incident_timestamp": "2026-11-10T09:00:00Z", "acknowledgement_timeout": 1800, "auto_resolve_timeout": 14400, "alert_creation": "create_alerts_and_incidents", "incident_urgency_rule": {"type": "constant", "urgency": "high"}, "integrations": ["PINTCHK1", "PINTCHK2"]},
+    {"id": "PSVCPAY", "name": "Payments", "description": "Card and wallet payments", "status": "warning", "escalation_policy": "PEPPAY", "teams": ["PTEAMPAY"], "created_at": "2024-02-01T12:00:00Z", "updated_at": "2026-10-20T10:00:00Z", "last_incident_timestamp": "2026-11-12T22:15:00Z", "acknowledgement_timeout": null, "auto_resolve_timeout": null, "alert_creation": "create_alerts_and_incidents", "incident_urgency_rule": {"type": "use_support_hours"}, "integrations": ["PINTPAY1"]},
+    {"id": "PSVCSEARCH", "name": "Search", "description": "Product search", "status": "disabled", "escalation_policy": "PEPCHK", "teams": ["PTEAMPLAT"], "created_at": "2024-03-01T12:00:00Z", "updated_at": "2026-11-14T03:00:00Z", "last_incident_timestamp": "2026-11-14T03:00:00Z", "acknowledgement_timeout": 3600, "auto_resolve_timeout": null, "alert_creation": "create_incidents", "incident_urgency_rule": {"type": "constant", "urgency": "low"}, "integrations": []}
+  ],
+  "business_services": [
+    {"id": "PBSSTORE", "name": "Online Store", "description": "The customer-facing store", "point_of_contact": "store-leads@example.com", "team": "PTEAMPLAT"},
+    {"id": "PBSBILL", "name": "Billing", "description": "Invoices and subscriptions", "point_of_contact": null, "team": "PTEAMPAY"}
+  ],
+  "dependencies": [
+    ["PREL1", "business_service", "PBSSTORE", "service", "PSVCCHK"],
+    ["PREL2", "business_service", "PBSSTORE", "service", "PSVCSEARCH"],
+    ["PREL3", "business_service", "PBSBILL", "service", "PSVCPAY"],
+    ["PREL4", "service", "PSVCCHK", "service", "PSVCPAY"]
+  ],
+  "priorities": [
+    {"id": "PPRI1", "name": "P1", "description": "Critical: customer-facing outage"},
+    {"id": "PPRI2", "name": "P2", "description": "High: degraded service"},
+    {"id": "PPRI3", "name": "P3", "description": "Moderate: internal impact"}
+  ],
+  "tags": [
+    {"id": "PTAG1", "label": "tier-1"},
+    {"id": "PTAG2", "label": "customer-facing"},
+    {"id": "PTAG3", "label": "tier-2"}
+  ],
+  "maintenance_windows": [
+    {"id": "PMW1", "sequence_number": 1, "description": "Search reindex", "start_time": "2026-10-01T02:00:00Z", "end_time": "2026-10-01T04:00:00Z", "created_by": "PUSRADA", "services": ["PSVCSEARCH"], "teams": ["PTEAMPLAT"]},
+    {"id": "PMW2", "sequence_number": 2, "description": "Search decommission", "start_time": "2026-11-01T00:00:00Z", "end_time": "2099-01-01T00:00:00Z", "created_by": "PUSRADA", "services": ["PSVCSEARCH"], "teams": ["PTEAMPLAT"]},
+    {"id": "PMW3", "sequence_number": 3, "description": "Payments datacenter move", "start_time": "2099-06-01T00:00:00Z", "end_time": "2099-06-02T00:00:00Z", "created_by": "PUSRGRACE", "services": ["PSVCPAY"], "teams": ["PTEAMPAY"]}
+  ],
+  "incidents": [
+    {"id": "Q2CHECKOUT500", "number": 1042, "title": "Checkout API 500s", "service": "PSVCCHK", "urgency": "high", "priority": "PPRI1", "status": "resolved", "created_at": "2026-11-10T09:00:00Z", "incident_key": "checkout-5xx", "assigned": [],
+     "log": [["trigger", "2026-11-10T09:00:00Z", "service", "PSVCCHK"], ["notify", "2026-11-10T09:00:30Z", "service", "PSVCCHK", {"user": "PUSRADA", "notification": "phone"}], ["acknowledge", "2026-11-10T09:04:00Z", "user", "PUSRADA"], ["annotate", "2026-11-10T09:10:00Z", "user", "PUSRADA", {"note": "Rolling back v2.3.1"}], ["assign", "2026-11-10T09:12:00Z", "user", "PUSRADA", {"assignees": ["PUSRALAN"]}], ["resolve", "2026-11-10T09:50:00Z", "user", "PUSRALAN"]],
+     "alerts": [["PALRT1", "critical", "resolved", "checkout-5xx", "HTTP 500 rate > 5%", "2026-11-10T08:59:50Z"], ["PALRT2", "critical", "resolved", "checkout-5xx", "HTTP 500 rate > 5% (eu)", "2026-11-10T09:01:00Z"], ["PALRT3", "warning", "resolved", "checkout-latency", "p99 latency > 2s", "2026-11-10T09:02:00Z"]],
+     "notes": [["PNOTE1", "PUSRADA", "2026-11-10T09:10:00Z", "Rolling back v2.3.1"], ["PNOTE2", "PUSRALAN", "2026-11-10T09:55:00Z", "Root cause: bad config in v2.3.1"]]},
+    {"id": "Q2PAYLATENCY", "number": 1043, "title": "Payments latency high", "service": "PSVCPAY", "urgency": "high", "priority": "PPRI2", "status": "acknowledged", "created_at": "2026-11-12T22:15:00Z", "incident_key": "pay-latency", "assigned": ["PUSRGRACE"],
+     "log": [["trigger", "2026-11-12T22:15:00Z", "service", "PSVCPAY"], ["notify", "2026-11-12T22:15:20Z", "service", "PSVCPAY", {"user": "PUSRKAT", "notification": "sms"}], ["escalate", "2026-11-12T22:25:00Z", "service", "PSVCPAY", {"assignees": ["PUSRGRACE"]}], ["notify", "2026-11-12T22:25:10Z", "service", "PSVCPAY", {"user": "PUSRGRACE", "notification": "phone"}], ["acknowledge", "2026-11-12T22:30:00Z", "user", "PUSRGRACE"]],
+     "alerts": [["PALRT4", "error", "triggered", "pay-latency", "Payments p99 > 3s", "2026-11-12T22:14:50Z"]],
+     "notes": []},
+    {"id": "Q2SEARCHIDX", "number": 1044, "title": "Search index lag", "service": "PSVCSEARCH", "urgency": "low", "priority": null, "status": "triggered", "created_at": "2026-11-14T03:00:00Z", "incident_key": "search-lag", "assigned": ["PUSRALAN"],
+     "log": [["trigger", "2026-11-14T03:00:00Z", "service", "PSVCSEARCH"], ["assign", "2026-11-14T03:00:01Z", "service", "PSVCSEARCH", {"assignees": ["PUSRALAN"]}]],
+     "alerts": [["PALRT5", "info", "triggered", "search-lag", "Index lag > 10 min", "2026-11-14T02:59:00Z"]],
+     "notes": []},
+    {"id": "Q2CHECKOUTDNS", "number": 1030, "title": "Checkout DNS failures", "service": "PSVCCHK", "urgency": "high", "priority": "PPRI1", "status": "resolved", "created_at": "2026-09-20T14:00:00Z", "incident_key": "checkout-dns", "assigned": [],
+     "log": [["trigger", "2026-09-20T14:00:00Z", "service", "PSVCCHK"], ["escalate", "2026-09-20T14:05:00Z", "service", "PSVCCHK", {"assignees": ["PUSRALAN"]}], ["notify", "2026-09-20T14:05:05Z", "service", "PSVCCHK", {"user": "PUSRALAN", "notification": "email"}], ["acknowledge", "2026-09-20T14:10:00Z", "user", "PUSRALAN"], ["resolve", "2026-09-20T15:30:00Z", "user", "PUSRALAN"]],
+     "alerts": [["PALRT6", "critical", "resolved", "checkout-dns", "NXDOMAIN for api.example.com", "2026-09-20T13:59:30Z"]],
+     "notes": [["PNOTE3", "PUSRALAN", "2026-09-20T15:31:00Z", "Registrar outage"]]},
+    {"id": "Q2PAYOLD", "number": 900, "title": "Payments batch job failed", "service": "PSVCPAY", "urgency": "low", "priority": "PPRI3", "status": "resolved", "created_at": "2026-03-05T06:00:00Z", "incident_key": "pay-batch", "assigned": [],
+     "log": [["trigger", "2026-03-05T06:00:00Z", "service", "PSVCPAY"], ["notify", "2026-03-05T06:00:10Z", "service", "PSVCPAY", {"user": "PUSRKAT", "notification": "push"}], ["acknowledge", "2026-03-05T06:20:00Z", "user", "PUSRKAT"], ["resolve", "2026-03-05T08:00:00Z", "user", "PUSRKAT"]],
+     "alerts": [], "notes": []},
+    {"id": "Q2OLDOPEN", "number": 800, "title": "Disk filling on search-3", "service": "PSVCSEARCH", "urgency": "low", "priority": null, "status": "triggered", "created_at": "2026-01-15T10:00:00Z", "incident_key": "search-disk", "assigned": ["PUSRALAN"],
+     "log": [["trigger", "2026-01-15T10:00:00Z", "service", "PSVCSEARCH"]],
+     "alerts": [], "notes": []},
+    {"id": "Q2LEGACY", "number": 12, "title": "Legacy checkout outage", "service": "PSVCCHK", "urgency": "high", "priority": null, "status": "resolved", "created_at": "2024-06-01T12:00:00Z", "incident_key": "legacy", "assigned": [],
+     "log": [["trigger", "2024-06-01T12:00:00Z", "service", "PSVCCHK"], ["acknowledge", "2024-06-01T12:05:00Z", "user", "PUSRADA"], ["resolve", "2024-06-01T13:00:00Z", "user", "PUSRADA"]],
+     "alerts": [], "notes": []}
+  ],
+  "change_events": [
+    {"id": "PCE1", "summary": "Deploy checkout v2.3.1", "timestamp": "2026-11-10T08:45:00Z", "source": "github-actions", "services": ["PSVCCHK"], "integration": "PINTCHK2", "links": [["https://ci.example.com/runs/981", "CI run 981"]], "custom_details": {"sha": "a1b2c3d", "author": "alan"}},
+    {"id": "PCE2", "summary": "Enable flag new-pricing", "timestamp": "2026-11-12T22:00:00Z", "source": "launchdarkly", "services": ["PSVCPAY"], "integration": "PINTPAY1", "links": [], "custom_details": {"flag": "new-pricing"}},
+    {"id": "PCE3", "summary": "Deploy search v1.9", "timestamp": "2026-11-01T10:00:00Z", "source": "github-actions", "services": ["PSVCSEARCH"], "integration": "PINTCHK1", "links": [], "custom_details": null},
+    {"id": "PCE4", "summary": "Deploy checkout v2.2.0", "timestamp": "2026-07-01T10:00:00Z", "source": "github-actions", "services": ["PSVCCHK"], "integration": "PINTCHK2", "links": [], "custom_details": null}
+  ],
+  "audit_records": [
+    {"id": "PAR1", "execution_time": "2026-11-02T10:00:00Z", "action": "update", "root": ["service_reference", "PSVCCHK", "Checkout API"], "actor": ["user_reference", "PUSRADA", "Ada Lovelace"], "method": ["browser", null, null], "remote_address": "198.51.100.7", "fields": [["auto_resolve_timeout", "7200", "14400"]]},
+    {"id": "PAR2", "execution_time": "2026-11-05T16:30:00Z", "action": "create", "root": ["team_reference", "PTEAMPAY", "Payments"], "actor": ["api_key_reference", "PKEY1", "terraform"], "method": ["api_token", "terraform key", "Xy3z"], "remote_address": "203.0.113.20", "fields": [["name", null, "Payments"]]},
+    {"id": "PAR3", "execution_time": "2026-11-11T08:00:00Z", "action": "delete", "root": ["schedule_reference", "PSCHOLD", "Old rotation"], "actor": ["user_reference", "PUSRGRACE", "Grace Hopper"], "method": ["browser", null, null], "remote_address": "198.51.100.9", "fields": []},
+    {"id": "PAR4", "execution_time": "2026-10-01T09:00:00Z", "action": "update", "root": ["escalation_policy_reference", "PEPPAY", "Payments"], "actor": ["user_reference", "PUSRADA", "Ada Lovelace"], "method": ["browser", null, null], "remote_address": "198.51.100.7", "fields": [["num_loops", "1", "2"]]},
+    {"id": "PAR5", "execution_time": "2026-11-12T12:00:00Z", "action": "update", "root": ["user_reference", "PUSRKAT", "Katherine Johnson"], "actor": ["user_reference", "PUSRKAT", "Katherine Johnson"], "method": ["oauth", "mobile app", null], "remote_address": "198.51.100.30", "fields": [["time_zone", "America/New_York", "America/Chicago"]]}
+  ],
+  "status_pages": [
+    {"id": "PSP1", "name": "Acme Status", "status_page_type": "public", "url": "https://status.example.com", "published_at": "2025-05-01T00:00:00Z"}
+  ]
+}

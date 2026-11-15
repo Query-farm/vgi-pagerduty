@@ -1,0 +1,681 @@
+# name: test/sql/pagerduty.test
+# description: SQL tests for the pagerduty worker against the strict offline PagerDuty replay server (test/mock_api/server.py)
+# group: [pagerduty]
+
+require vgi
+
+require-env PAGERDUTY_WORKER
+
+require-env PAGERDUTY_FIXTURE_URL
+
+# httpfs + json read the replay server's /__requests log to assert what was pushed down.
+statement ok
+LOAD httpfs;
+
+statement ok
+LOAD json;
+
+statement ok
+ATTACH 'pagerduty' (TYPE vgi, LOCATION '{PAGERDUTY_WORKER}');
+
+# ---------------------------------------------------------------- secret errors
+
+statement error
+SELECT count(*) FROM pagerduty.main.services;
+----
+<REGEX>:.*no pagerduty secret.*
+
+statement ok
+CREATE SECRET pd_bad (TYPE pagerduty, API_TOKEN 'wrong-token', BASE_URL '{PAGERDUTY_FIXTURE_URL}');
+
+statement error
+SELECT count(*) FROM pagerduty.main.priorities;
+----
+<REGEX>:.*HTTP 401.*code 2006.*
+
+statement ok
+DROP SECRET pd_bad;
+
+statement ok
+CREATE SECRET pd_insecure (TYPE pagerduty, API_TOKEN 'x', BASE_URL 'http://api.pagerduty.com');
+
+statement error
+SELECT count(*) FROM pagerduty.main.priorities;
+----
+<REGEX>:.*https.*
+
+statement ok
+DROP SECRET pd_insecure;
+
+statement ok
+CREATE SECRET pd_region (TYPE pagerduty, API_TOKEN 'x', REGION 'mars');
+
+statement error
+SELECT count(*) FROM pagerduty.main.priorities;
+----
+<REGEX>:.*region must be 'us' or 'eu'.*
+
+statement ok
+DROP SECRET pd_region;
+
+statement ok
+CREATE SECRET pd_empty (TYPE pagerduty, REGION 'eu');
+
+statement error
+SELECT count(*) FROM pagerduty.main.priorities;
+----
+<REGEX>:.*API_TOKEN.*OAUTH_TOKEN.*
+
+statement ok
+DROP SECRET pd_empty;
+
+# OAuth bearer tokens work too.
+statement ok
+CREATE SECRET pd_oauth (TYPE pagerduty, OAUTH_TOKEN 'test-oauth', BASE_URL '{PAGERDUTY_FIXTURE_URL}');
+
+query I
+SELECT count(*) FROM pagerduty.main.tags;
+----
+3
+
+query T
+SELECT auth FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/tags') ORDER BY seq DESC LIMIT 1;
+----
+bearer
+
+statement ok
+DROP SECRET pd_oauth;
+
+statement ok
+CREATE SECRET pd (TYPE pagerduty, API_TOKEN 'test-token', BASE_URL '{PAGERDUTY_FIXTURE_URL}');
+
+# -------------------------------------------------------- rate limits and retries
+
+# The first /services request is a 429 (ratelimit-reset: 1); the first /priorities a 503.
+query TTT
+SELECT name, status, urgency_rule FROM pagerduty.main.services ORDER BY name;
+----
+Checkout API	active	constant:high
+Payments	warning	use_support_hours
+Search	disabled	constant:low
+
+query I
+SELECT count(*) >= 2 FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/services');
+----
+true
+
+query ITT
+SELECT rank, name, description FROM pagerduty.main.priorities ORDER BY rank;
+----
+1	P1	Critical: customer-facing outage
+2	P2	High: degraded service
+3	P3	Moderate: internal impact
+
+# ------------------------------------------------------------------- incidents
+
+query IITTTTT
+SELECT incident_number, time_to_resolve_seconds, status, urgency, priority, service, assignees
+FROM pagerduty.main.incidents(date_range := 'all') ORDER BY incident_number;
+----
+12	3600.0	resolved	high	NULL	Checkout API	[]
+800	NULL	triggered	low	NULL	Search	[Alan Turing]
+900	7200.0	resolved	low	P3	Payments	[]
+1030	5400.0	resolved	high	P1	Checkout API	[]
+1042	3000.0	resolved	high	P1	Checkout API	[]
+1043	NULL	acknowledged	high	P2	Payments	[Grace Hopper]
+1044	NULL	triggered	low	NULL	Search	[Alan Turing]
+
+# Without the timeline only an open incident's current acknowledgement is known.
+query ITRT
+SELECT incident_number, acknowledged_at, time_to_ack_seconds, timeline_source
+FROM pagerduty.main.incidents(date_range := 'all') WHERE incident_number IN (1042, 1043) ORDER BY 1;
+----
+1042	NULL	NULL	incident
+1043	2026-11-12 22:30:00+00	900.0	incident
+
+# with_timeline reads each incident's log entries: exact MTTA / MTTR, who acked and resolved.
+query IRRTTIT
+SELECT incident_number, time_to_ack_seconds, time_to_resolve_seconds, acknowledged_by, resolved_by, escalation_count, timeline_source
+FROM pagerduty.main.incidents(date_range := 'all', with_timeline := true) ORDER BY incident_number;
+----
+12	300.0	3600.0	Ada Lovelace	Ada Lovelace	0	log_entries
+800	NULL	NULL	NULL	NULL	0	log_entries
+900	1200.0	7200.0	Katherine Johnson	Katherine Johnson	0	log_entries
+1030	600.0	5400.0	Alan Turing	Alan Turing	1	log_entries
+1042	240.0	3000.0	Ada Lovelace	Alan Turing	0	log_entries
+1043	900.0	NULL	Grace Hopper	NULL	1	log_entries
+1044	NULL	NULL	NULL	NULL	0	log_entries
+
+query I
+SELECT count(*) FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?prefix=/incidents/') WHERE path LIKE '%/log_entries' AND query::JSON->>'is_overview' = 'true';
+----
+7
+
+# Pushdown: status / urgency / service_id become PagerDuty's array parameters.
+query I
+SELECT incident_number FROM pagerduty.main.incidents(date_range := 'all')
+WHERE status = 'resolved' AND urgency = 'high' AND service_id IN ('PSVCCHK', 'PSVCPAY') ORDER BY 1;
+----
+12
+1030
+1042
+
+query TTTT
+SELECT query::JSON->>'statuses[]', query::JSON->>'urgencies[]', query::JSON->'service_ids[]', query::JSON->>'date_range'
+FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/incidents') ORDER BY seq DESC LIMIT 1;
+----
+resolved	high	["PSVCCHK","PSVCPAY"]	all
+
+# An open-only status filter with no time bound reads every open incident (date_range=all).
+query IT
+SELECT incident_number, status FROM pagerduty.main.incidents() WHERE status IN ('triggered', 'acknowledged') ORDER BY 1;
+----
+800	triggered
+1043	acknowledged
+1044	triggered
+
+query TT
+SELECT query::JSON->'statuses[]', query::JSON->>'date_range' FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/incidents') ORDER BY seq DESC LIMIT 1;
+----
+["triggered","acknowledged"]	all
+
+# The default window is the last 30 days.
+statement ok
+SELECT count(*) FROM pagerduty.main.incidents();
+
+query II
+SELECT date_diff('day', CAST(query::JSON->>'since' AS TIMESTAMP), CAST(query::JSON->>'until' AS TIMESTAMP)), query::JSON->>'total' = 'true'
+FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/incidents') ORDER BY seq DESC LIMIT 1;
+----
+30	true
+
+# A created_at range longer than PagerDuty's 6-month limit is read in 180-day chunks.
+statement ok
+CREATE TEMP TABLE mark AS SELECT max(seq) AS m FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?prefix=/');
+
+query I
+SELECT count(*) FROM pagerduty.main.incidents()
+WHERE created_at >= TIMESTAMPTZ '2024-01-01 00:00:00+00' AND created_at < TIMESTAMPTZ '2026-12-01 00:00:00+00';
+----
+7
+
+query III
+SELECT count(*), max(date_diff('day', CAST(query::JSON->>'since' AS TIMESTAMP), CAST(query::JSON->>'until' AS TIMESTAMP))) <= 180,
+       min(query::JSON->>'since') = '2024-01-01T00:00:00.000Z'
+FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/incidents') WHERE seq > (SELECT m FROM mark);
+----
+6	true	true
+
+statement ok
+DROP TABLE mark;
+
+# since := / until := arguments set the window too, and several pages are read (page_size := 2).
+query II
+SELECT count(*), count(DISTINCT incident_id)
+FROM pagerduty.main.incidents(since := TIMESTAMPTZ '2026-09-01 00:00:00+00', until := TIMESTAMPTZ '2026-12-01 00:00:00+00', page_size := 2);
+----
+4	4
+
+query I
+SELECT count(*) FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/incidents') WHERE query::JSON->>'limit' = '2';
+----
+2
+
+# Newest first + LIMIT stops paging early.
+query I
+SELECT incident_number FROM pagerduty.main.incidents(date_range := 'all', sort_by := 'created_at:desc', page_size := 2) LIMIT 1;
+----
+1044
+
+# team_ids / user_ids arguments are array parameters.
+query I
+SELECT incident_number FROM pagerduty.main.incidents(date_range := 'all', team_ids := ['PTEAMPAY'], user_ids := ['PUSRGRACE']) ORDER BY 1;
+----
+1043
+
+query TT
+SELECT query::JSON->>'team_ids[]', query::JSON->>'user_ids[]' FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/incidents') ORDER BY seq DESC LIMIT 1;
+----
+PTEAMPAY	PUSRGRACE
+
+# incident_id = / IN fetches those incidents directly; an unknown id is zero rows.
+query IT
+SELECT incident_number, title FROM pagerduty.main.incidents() WHERE incident_id IN ('Q2CHECKOUT500', 'Q2LEGACY', 'QNOPE') ORDER BY 1;
+----
+12	Legacy checkout outage
+1042	Checkout API 500s
+
+query I
+SELECT count(*) FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/incidents/QNOPE');
+----
+1
+
+query I
+SELECT incident_number FROM pagerduty.main.incidents(date_range := 'all') WHERE incident_key = 'pay-latency';
+----
+1043
+
+query T
+SELECT query::JSON->>'incident_key' FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/incidents') ORDER BY seq DESC LIMIT 1;
+----
+pay-latency
+
+# Bind-time argument constraints.
+statement error
+SELECT * FROM pagerduty.main.incidents(sort_by := 'title');
+----
+<REGEX>:.*sort_by.*
+
+statement error
+SELECT * FROM pagerduty.main.incidents(page_size := 500);
+----
+<REGEX>:.*page_size.*
+
+# ------------------------------------------------------------ incident timeline
+
+query TTTTTT
+SELECT type, agent_name, strftime(CAST(created_at AS TIMESTAMP), '%H:%M:%S'), assignees, user_name || '/' || notification_type, note
+FROM pagerduty.main.incident_log_entries(incident_id := 'Q2CHECKOUT500') ORDER BY created_at;
+----
+trigger	Checkout API	09:00:00	NULL	NULL	NULL
+notify	Checkout API	09:00:30	NULL	Ada Lovelace/phone	NULL
+acknowledge	Ada Lovelace	09:04:00	NULL	NULL	NULL
+annotate	Ada Lovelace	09:10:00	NULL	NULL	Rolling back v2.3.1
+assign	Ada Lovelace	09:12:00	[Alan Turing]	NULL	NULL
+resolve	Alan Turing	09:50:00	NULL	NULL	NULL
+
+# Account-wide, windowed; WHERE incident_id IN reads the per-incident endpoint instead.
+query II
+SELECT count(*), count(DISTINCT incident_id)
+FROM pagerduty.main.incident_log_entries(since := TIMESTAMPTZ '2026-09-01 00:00:00+00', until := TIMESTAMPTZ '2026-12-01 00:00:00+00', is_overview := true);
+----
+13	4
+
+query TI
+SELECT incident_id, count(*) FROM pagerduty.main.incident_log_entries() WHERE incident_id IN ('Q2PAYOLD', 'Q2LEGACY') GROUP BY 1 ORDER BY 1;
+----
+Q2LEGACY	3
+Q2PAYOLD	4
+
+# Time to acknowledge computed from the timeline in SQL.
+query R
+SELECT date_diff('second', CAST(min(created_at) FILTER (type = 'trigger') AS TIMESTAMP), CAST(min(created_at) FILTER (type = 'acknowledge') AS TIMESTAMP))
+FROM pagerduty.main.incident_log_entries(incident_id := 'Q2CHECKOUTDNS');
+----
+600
+
+# ------------------------------------------------------------- alerts and notes
+
+query TTI
+SELECT incident_id, severity, count(*) FROM pagerduty.main.incident_alerts(since := TIMESTAMPTZ '2026-09-01 00:00:00+00', until := TIMESTAMPTZ '2026-12-01 00:00:00+00')
+GROUP BY ALL ORDER BY ALL;
+----
+Q2CHECKOUT500	critical	2
+Q2CHECKOUT500	warning	1
+Q2CHECKOUTDNS	critical	1
+Q2PAYLATENCY	error	1
+Q2SEARCHIDX	info	1
+
+query TTT
+SELECT alert_id, status, details->>'key' FROM pagerduty.main.incident_alerts() WHERE incident_id = 'Q2PAYLATENCY' AND status = 'triggered';
+----
+PALRT4	triggered	pay-latency
+
+query T
+SELECT query::JSON->>'statuses[]' FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/incidents/Q2PAYLATENCY/alerts') ORDER BY seq DESC LIMIT 1;
+----
+triggered
+
+query TTT
+SELECT incident_id, user_name, content FROM pagerduty.main.incident_notes() WHERE incident_id IN ('Q2CHECKOUT500', 'Q2CHECKOUTDNS') ORDER BY created_at;
+----
+Q2CHECKOUTDNS	Alan Turing	Registrar outage
+Q2CHECKOUT500	Ada Lovelace	Rolling back v2.3.1
+Q2CHECKOUT500	Alan Turing	Root cause: bad config in v2.3.1
+
+# --------------------------------------------------------------------- on-call
+
+query TITTT
+SELECT escalation_policy_name, escalation_level, user_name, start_time, end_time
+FROM pagerduty.main.oncalls(since := TIMESTAMPTZ '2026-11-05 00:00:00+00', until := TIMESTAMPTZ '2026-11-10 00:00:00+00')
+ORDER BY ALL;
+----
+Checkout	1	Ada Lovelace	2026-11-01 00:00:00+00	2026-11-08 00:00:00+00
+Checkout	1	Alan Turing	2026-11-08 00:00:00+00	2026-11-15 00:00:00+00
+Checkout	2	Grace Hopper	NULL	NULL
+Payments	1	Grace Hopper	2026-11-01 00:00:00+00	2026-11-08 00:00:00+00
+Payments	1	Katherine Johnson	2026-11-08 00:00:00+00	2026-11-15 00:00:00+00
+Payments	2	Katherine Johnson	NULL	NULL
+Payments	3	Ada Lovelace	NULL	NULL
+Payments	3	Grace Hopper	NULL	NULL
+
+# Right now: one first-level responder per policy (who it is depends on today's date).
+query TII
+SELECT escalation_policy_id, count(*), count(DISTINCT user_id) FROM pagerduty.main.oncalls() WHERE escalation_level = 1 GROUP BY 1 ORDER BY 1;
+----
+PEPCHK	1	1
+PEPPAY	1	1
+
+query IT
+SELECT escalation_level, user_name FROM pagerduty.main.oncalls() WHERE escalation_policy_id = 'PEPPAY' AND user_id IN ('PUSRKAT', 'PUSRADA') AND escalation_level > 1 ORDER BY 1;
+----
+2	Katherine Johnson
+3	Ada Lovelace
+
+query TTT
+SELECT query::JSON->>'escalation_policy_ids[]', query::JSON->'user_ids[]', query::JSON->>'time_zone' FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/oncalls') ORDER BY seq DESC LIMIT 1;
+----
+PEPPAY	["PUSRKAT","PUSRADA"]	UTC
+
+statement error
+SELECT * FROM pagerduty.main.oncalls(since := TIMESTAMPTZ '2026-01-01', until := TIMESTAMPTZ '2026-06-01');
+----
+<REGEX>:.*90 days.*
+
+query TTTTR
+SELECT schedule_name, user_name, start_time, end_time, duration_seconds / 3600
+FROM pagerduty.main.schedule_entries(since := TIMESTAMPTZ '2026-11-05 00:00:00+00', until := TIMESTAMPTZ '2026-11-10 00:00:00+00')
+ORDER BY ALL;
+----
+Checkout Primary	Ada Lovelace	2026-11-05 00:00:00+00	2026-11-08 00:00:00+00	72.0
+Checkout Primary	Alan Turing	2026-11-08 00:00:00+00	2026-11-10 00:00:00+00	48.0
+Payments Primary	Grace Hopper	2026-11-05 00:00:00+00	2026-11-08 00:00:00+00	72.0
+Payments Primary	Katherine Johnson	2026-11-08 00:00:00+00	2026-11-10 00:00:00+00	48.0
+
+query TR
+SELECT user_name, sum(duration_seconds) / 3600 FROM pagerduty.main.schedule_entries(schedule_id := 'PSCHPAY', since := TIMESTAMPTZ '2026-11-01 00:00:00+00', until := TIMESTAMPTZ '2026-11-29 00:00:00+00')
+GROUP BY 1 ORDER BY 1;
+----
+Grace Hopper	336.0
+Katherine Johnson	336.0
+
+query TTTIT
+SELECT escalation_policy, target_type, target_name, level, rule_id FROM pagerduty.main.escalation_rules ORDER BY escalation_policy, level, target_name;
+----
+Checkout	schedule	Checkout Primary	1	PRULECHK1
+Checkout	user	Grace Hopper	2	PRULECHK2
+Payments	schedule	Payments Primary	1	PRULEPAY1
+Payments	user	Katherine Johnson	2	PRULEPAY2
+Payments	user	Ada Lovelace	3	PRULEPAY3
+Payments	user	Grace Hopper	3	PRULEPAY3
+
+query I
+SELECT count(*) FROM pagerduty.main.escalation_rules WHERE escalation_policy_id = 'PEPPAY';
+----
+4
+
+query I
+SELECT count(*) FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/escalation_policies/PEPPAY');
+----
+1
+
+query TIIT
+SELECT name, num_loops, rule_count, service_ids FROM pagerduty.main.escalation_policies ORDER BY name;
+----
+Checkout	0	2	[PSVCCHK, PSVCSEARCH]
+Payments	2	3	[PSVCPAY]
+
+query TTT
+SELECT name, time_zone, users FROM pagerduty.main.schedules WHERE name = 'Payments Primary';
+----
+Payments Primary	America/New_York	[Grace Hopper, Katherine Johnson]
+
+query T
+SELECT query::JSON->>'query' FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/schedules') ORDER BY seq DESC LIMIT 1;
+----
+Payments Primary
+
+# ---------------------------------------------------------------------- people
+
+query TTTI
+SELECT name, role, contact_method_types, contact_method_count FROM pagerduty.main.users ORDER BY name;
+----
+Ada Lovelace	admin	[email, phone, push]	3
+Alan Turing	limited_user	[email]	1
+Grace Hopper	user	[email, sms]	2
+Katherine Johnson	user	[email, phone]	3
+
+query TT
+SELECT user_id, teams FROM pagerduty.main.users WHERE email = 'grace@example.com';
+----
+PUSRGRACE	[Payments]
+
+# Contact methods are never expanded (that would read phone numbers and addresses).
+query I
+SELECT count(*) FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/users') WHERE query LIKE '%include%';
+----
+0
+
+query TTTT
+SELECT team_name, user_name, role, team_id FROM pagerduty.main.team_members ORDER BY team_name, user_name;
+----
+Payments	Ada Lovelace	observer	PTEAMPAY
+Payments	Grace Hopper	manager	PTEAMPAY
+Payments	Katherine Johnson	responder	PTEAMPAY
+Platform	Ada Lovelace	manager	PTEAMPLAT
+Platform	Alan Turing	responder	PTEAMPLAT
+
+query TT
+SELECT user_name, role FROM pagerduty.main.team_members WHERE team_id = 'PTEAMPLAT' ORDER BY 1;
+----
+Ada Lovelace	manager
+Alan Turing	responder
+
+query TT
+SELECT name, parent_team_id FROM pagerduty.main.teams ORDER BY name;
+----
+Payments	PTEAMPLAT
+Platform	NULL
+
+# -------------------------------------------------------- services and the graph
+
+query TTTT
+SELECT relationship_id, dependent_service_type, dependent_service_id, supporting_service_id FROM pagerduty.main.service_dependencies ORDER BY 1;
+----
+PREL1	business_service	PBSSTORE	PSVCCHK
+PREL2	business_service	PBSSTORE	PSVCSEARCH
+PREL3	business_service	PBSBILL	PSVCPAY
+PREL4	service	PSVCCHK	PSVCPAY
+
+query TT
+SELECT b.name, s.name FROM pagerduty.main.service_dependencies d
+JOIN pagerduty.main.business_services b ON b.business_service_id = d.dependent_service_id
+JOIN pagerduty.main.services s ON s.service_id = d.supporting_service_id ORDER BY 1, 2;
+----
+Billing	Payments
+Online Store	Checkout API
+Online Store	Search
+
+query TT
+SELECT maintenance_window_id, status FROM pagerduty.main.maintenance_windows ORDER BY 1;
+----
+PMW1	past
+PMW2	ongoing
+PMW3	future
+
+query TT
+SELECT maintenance_window_id, services FROM pagerduty.main.maintenance_windows WHERE status = 'ongoing';
+----
+PMW2	[Search]
+
+query T
+SELECT query::JSON->>'filter' FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/maintenance_windows') ORDER BY seq DESC LIMIT 1;
+----
+ongoing
+
+# --------------------------------------------------------------------- changes
+
+query TTTT
+SELECT change_event_id, summary, services, links[1].text FROM pagerduty.main.change_events(since := TIMESTAMPTZ '2026-06-01 00:00:00+00', until := TIMESTAMPTZ '2026-12-01 00:00:00+00')
+ORDER BY occurred_at;
+----
+PCE4	Deploy checkout v2.2.0	[Checkout API]	NULL
+PCE3	Deploy search v1.9	[Search]	NULL
+PCE1	Deploy checkout v2.3.1	[Checkout API]	CI run 981
+PCE2	Enable flag new-pricing	[Payments]	NULL
+
+query TT
+SELECT change_event_id, custom_details->>'sha' FROM pagerduty.main.change_events()
+WHERE occurred_at >= TIMESTAMPTZ '2026-11-10 00:00:00+00' AND occurred_at < TIMESTAMPTZ '2026-11-11 00:00:00+00';
+----
+PCE1	a1b2c3d
+
+query TT
+SELECT query::JSON->>'since', query::JSON->>'until' FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/change_events') ORDER BY seq DESC LIMIT 1;
+----
+2026-11-10T00:00:00.000Z	2026-11-11T00:00:00.000Z
+
+# Changes on the same service in the hour before each incident.
+query IT
+SELECT i.incident_number, c.summary FROM pagerduty.main.incidents(date_range := 'all') i
+JOIN pagerduty.main.change_events(since := TIMESTAMPTZ '2026-09-01 00:00:00+00', until := TIMESTAMPTZ '2026-12-01 00:00:00+00') c
+  ON list_contains(c.service_ids, i.service_id)
+ AND CAST(c.occurred_at AS TIMESTAMP) BETWEEN CAST(i.created_at AS TIMESTAMP) - INTERVAL 1 HOUR AND CAST(i.created_at AS TIMESTAMP)
+ORDER BY 1;
+----
+1042	Deploy checkout v2.3.1
+1043	Enable flag new-pricing
+
+# ---------------------------------------------------------------- audit records
+
+# A 70-day window is read in 31-day chunks with cursor paging (page_size := 2).
+statement ok
+CREATE TEMP TABLE mark AS SELECT coalesce(max(seq), 0) AS m FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?prefix=/');
+
+query TTTTT
+SELECT record_id, action, root_resource_type, actor_name, changed_fields[1].before_value || ' -> ' || changed_fields[1].value
+FROM pagerduty.main.audit_records(page_size := 2)
+WHERE execution_time >= TIMESTAMPTZ '2026-09-15 00:00:00+00' AND execution_time < TIMESTAMPTZ '2026-11-24 00:00:00+00'
+ORDER BY execution_time;
+----
+PAR4	update	escalation_policies	Ada Lovelace	1 -> 2
+PAR1	update	services	Ada Lovelace	7200 -> 14400
+PAR2	create	teams	terraform	NULL
+PAR3	delete	schedules	Grace Hopper	NULL
+PAR5	update	users	Katherine Johnson	America/New_York -> America/Chicago
+
+query II
+SELECT count(DISTINCT query::JSON->>'since'), count(*) FILTER (query::JSON->>'cursor' IS NOT NULL) > 0
+FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/audit/records') WHERE seq > (SELECT m FROM mark);
+----
+3	true
+
+statement ok
+DROP TABLE mark;
+
+query TT
+SELECT record_id, method_type FROM pagerduty.main.audit_records(since := TIMESTAMPTZ '2026-11-01 00:00:00+00', until := TIMESTAMPTZ '2026-11-30 00:00:00+00')
+WHERE action IN ('create', 'delete') AND root_resource_type IN ('teams', 'schedules') AND actor_type = 'api_key_reference';
+----
+PAR2	api_token
+
+query TTT
+SELECT query::JSON->'actions[]', query::JSON->'root_resource_types[]', query::JSON->>'actor_type' FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/audit/records') ORDER BY seq DESC LIMIT 1;
+----
+["create","delete"]	["teams","schedules"]	api_key_reference
+
+# -------------------------------------------------------------------- analytics
+
+query IRRIT
+SELECT incident_number, time_to_ack_seconds, time_to_resolve_seconds, sleep_hour_interruptions, major
+FROM pagerduty.main.analytics_incidents(since := TIMESTAMPTZ '2024-01-01 00:00:00+00', until := TIMESTAMPTZ '2026-12-01 00:00:00+00', page_size := 2)
+ORDER BY 1;
+----
+12	300.0	3600.0	0	false
+800	NULL	NULL	0	false
+900	1200.0	7200.0	0	false
+1030	600.0	5400.0	0	true
+1042	240.0	3000.0	0	true
+1043	900.0	NULL	2	false
+1044	NULL	NULL	0	false
+
+# Analytics and with_timeline agree on time to acknowledge.
+query I
+SELECT count(*) FROM pagerduty.main.analytics_incidents(since := TIMESTAMPTZ '2024-01-01 00:00:00+00', until := TIMESTAMPTZ '2026-12-01 00:00:00+00') a
+JOIN pagerduty.main.incidents(date_range := 'all', with_timeline := true) i USING (incident_id)
+WHERE a.time_to_ack_seconds IS NOT DISTINCT FROM i.time_to_ack_seconds;
+----
+7
+
+query IT
+SELECT incident_number, priority FROM pagerduty.main.analytics_incidents(since := TIMESTAMPTZ '2026-01-01 00:00:00+00', until := TIMESTAMPTZ '2026-12-01 00:00:00+00')
+WHERE urgency = 'high' AND service_id IN ('PSVCCHK', 'PSVCPAY') AND major ORDER BY 1;
+----
+1030	P1
+1042	P1
+
+query TTT
+SELECT body::JSON->'filters'->>'urgency', body::JSON->'filters'->'service_ids', body::JSON->'filters'->>'major'
+FROM read_json('{PAGERDUTY_FIXTURE_URL}/__requests?path=/analytics/raw/incidents') ORDER BY seq DESC LIMIT 1;
+----
+high	["PSVCCHK","PSVCPAY"]	true
+
+query TIRR
+SELECT range_start, total_incident_count, mean_time_to_ack_seconds, mean_time_to_resolve_seconds
+FROM pagerduty.main.analytics_incident_metrics(since := TIMESTAMPTZ '2026-09-01 00:00:00+00', until := TIMESTAMPTZ '2026-12-01 00:00:00+00', aggregate_unit := 'month')
+ORDER BY 1;
+----
+2026-09-01 00:00:00+00	1	600.0	5400.0
+2026-11-01 00:00:00+00	3	570.0	3000.0
+
+query IR
+SELECT total_incident_count, mean_time_to_ack_seconds FROM pagerduty.main.analytics_incident_metrics(since := TIMESTAMPTZ '2026-01-01 00:00:00+00', until := TIMESTAMPTZ '2026-12-01 00:00:00+00', urgency := 'low');
+----
+3	1200.0
+
+statement error
+SELECT * FROM pagerduty.main.analytics_incident_metrics(since := TIMESTAMPTZ '2024-01-01', until := TIMESTAMPTZ '2026-01-01');
+----
+<REGEX>:.*1 year.*
+
+# -------------------------------------------------------- feature detection
+
+query TT
+SELECT name, status_page_type FROM pagerduty.main.status_pages;
+----
+Acme Status	public
+
+query TTI
+SELECT feature, available, http_status FROM pagerduty.main.account_features ORDER BY feature;
+----
+analytics	true	200
+audit_records	true	200
+business_services	true	200
+change_events	true	200
+rest_api	true	200
+status_pages	true	200
+
+# A key without the add-ons: account_features says so, and the add-on functions explain.
+statement ok
+DROP SECRET pd;
+
+statement ok
+CREATE SECRET pd_limited (TYPE pagerduty, API_TOKEN 'limited-token', BASE_URL '{PAGERDUTY_FIXTURE_URL}');
+
+query TTI
+SELECT feature, available, http_status FROM pagerduty.main.account_features ORDER BY feature;
+----
+analytics	false	402
+audit_records	false	403
+business_services	true	200
+change_events	true	200
+rest_api	true	200
+status_pages	false	402
+
+statement error
+SELECT * FROM pagerduty.main.status_pages;
+----
+<REGEX>:.*Status Pages API is not available.*account_features.*
+
+statement error
+SELECT * FROM pagerduty.main.analytics_incidents();
+----
+<REGEX>:.*Analytics API is not available.*HTTP 402.*
+
+statement error
+SELECT * FROM pagerduty.main.audit_records();
+----
+<REGEX>:.*Audit Records API is not available.*HTTP 403.*
+
+statement ok
+DROP SECRET pd_limited;
