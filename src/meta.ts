@@ -119,15 +119,18 @@ export const CATALOG_DOC_MD =
   "windows, offset and cursor paging are resumable, and 429 rate limits are retried after the reset.\n\n" +
   SOURCES_MD;
 
+export const SCHEMA_COMMENT =
+  "Read-only PagerDuty REST API v2 collections: incidents, on-call, services, people, changes, analytics and audit.";
+
 export const SCHEMA_DOC_LLM =
-  "PagerDuty REST API v2 collections as SQL. Account-wide collections without arguments are tables " +
-  "(services, users, teams, schedules, escalation_policies, escalation_rules, team_members, business_services, " +
-  "service_dependencies, maintenance_windows, priorities, tags, status_pages, account_features). Time-windowed " +
-  "or per-incident data are table functions with named arguments: incidents(), incident_log_entries(), " +
-  "incident_alerts(), incident_notes(), oncalls(), schedule_entries(), change_events(), audit_records(), " +
-  "analytics_incidents(), analytics_incident_metrics(). Per-parent collections take the parent id as a named " +
-  "argument or a pushed `= / IN` filter and otherwise read every parent (one extra call each). All objects " +
-  "need a `pagerduty` secret.";
+  "PagerDuty REST API v2 collections as SQL. Account-wide configuration that needs no arguments (services, " +
+  "people and teams, schedules and escalation policies, the business-service graph, account settings) is " +
+  "exposed as plain tables. Time-windowed and per-incident data (incidents and their timelines, alerts and " +
+  "notes, on-call shifts, change events, analytics and audit records) are table functions: pass since := / " +
+  "until := or filter on the time column to pick the window (default the last 30 days, chunked to " +
+  "PagerDuty's limits). Per-parent collections take the parent id as a named argument or a pushed `= / IN` " +
+  "filter and otherwise read every parent (one extra call each). Status, urgency and id filters push down " +
+  "into PagerDuty's query parameters and are re-checked exactly. All objects need a `pagerduty` secret.";
 
 export const SCHEMA_DOC_MD =
   "## main\n\n" +
