@@ -1,5 +1,5 @@
 {
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "PagerDuty incident management (incidents, timelines, on-call, schedules, services, teams, change events, analytics, audit records) as SQL tables in DuckDB.",
